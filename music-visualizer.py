@@ -18,7 +18,7 @@ import psutil
 
 COM_PORT = "AUTO"
 REVISION = "A"
-IDLE_STYLE = "flip"  # tela ociosa: "digital" (relogio 7-seg) ou "flip" (painel de aeroporto)
+IDLE_STYLE = "digital"  # tela ociosa: "digital" (relogio 7-seg) ou "flip" (painel de aeroporto)
 stop = False
 script_dir = dirname(abspath(__file__))
 
@@ -30,8 +30,9 @@ font_temp = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Robot
 # --- Tela idle: relogio digital + metricas (tema escuro) --------------------
 dseg_big   = ImageFont.truetype(join(script_dir, "res", "fonts", "dseg", "DSEG7Classic-Bold.ttf"), 96)
 dseg_val   = ImageFont.truetype(join(script_dir, "res", "fonts", "dseg", "DSEG7Classic-Bold.ttf"), 30)
-idle_label = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Black.ttf"), 22)
+idle_label = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 22)
 idle_unit  = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 20)
+idle_date_font = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 22)
 IDLE_ACCENT = (56, 225, 255)   # cor "acesa" do relogio (ciano) - troque aqui p/ mudar o tema
 IDLE_GHOST  = (20, 48, 60)     # segmentos apagados do display
 IDLE_MUTED  = (120, 140, 165)  # rotulos/data
@@ -155,29 +156,32 @@ def draw_idle_screen():
     draw.text((cx, clock_y), hhmm, font=dseg_big, fill=IDLE_ACCENT)
 
     # data centralizada
-    bbd = draw.textbbox((0, 0), date_str, font=font_light_small)
+    bbd = draw.textbbox((0, 0), date_str, font=idle_date_font)
     dx = (480 - (bbd[2] - bbd[0])) // 2 - bbd[0]
-    draw.text((dx, 150), date_str, font=font_light_small, fill=IDLE_MUTED)
+    draw.text((dx, 150), date_str, font=idle_date_font, fill=IDLE_MUTED)
 
     draw.line((60, 196, 420, 196), fill=(30, 40, 52), width=2)
 
     def row(y, label, t_val, u_val):
-        draw.text((70, y), label, font=idle_label, fill=IDLE_MUTED)
-        if t_val is not None:
-            tc = _temp_color(t_val)
-            s = f"{t_val:.0f}"
-            draw.text((150, y - 2), s, font=dseg_val, fill=tc)
-            b = draw.textbbox((150, y - 2), s, font=dseg_val)
-            draw.text((b[2] + 4, y + 2), "°C", font=idle_unit, fill=tc)
-        else:
-            draw.text((150, y + 2), "--", font=idle_unit, fill=IDLE_MUTED)
-        if u_val is not None:
-            s = f"{u_val:.0f}"
-            draw.text((250, y - 2), s, font=dseg_val, fill=IDLE_ACCENT)
-            b = draw.textbbox((250, y - 2), s, font=dseg_val)
-            draw.text((b[2] + 4, y + 2), "%", font=idle_unit, fill=IDLE_ACCENT)
-        else:
-            draw.text((250, y + 2), "--", font=idle_unit, fill=IDLE_MUTED)
+        t_s = f"{t_val:.0f}" if t_val is not None else "--"
+        u_s = f"{u_val:.0f}" if u_val is not None else "--"
+        t_font = dseg_val if t_val is not None else idle_unit
+        u_font = dseg_val if u_val is not None else idle_unit
+        LG, UG, SG = 16, 4, 30
+        lw  = draw.textlength(label, font=idle_label)
+        tw_ = draw.textlength(t_s, font=t_font)
+        dcw = draw.textlength("°C", font=idle_unit)
+        uw_ = draw.textlength(u_s, font=u_font)
+        pcw = draw.textlength("%", font=idle_unit)
+        total = lw + LG + tw_ + UG + dcw + SG + uw_ + UG + pcw
+        x = (480 - total) // 2
+        tc = _temp_color(t_val)
+        uc = IDLE_ACCENT if u_val is not None else IDLE_MUTED
+        draw.text((x, y), label, font=idle_label, fill=IDLE_MUTED); x += lw + LG
+        draw.text((x, y - 2), t_s, font=t_font, fill=tc);          x += tw_ + UG
+        draw.text((x, y + 2), "°C", font=idle_unit, fill=tc);      x += dcw + SG
+        draw.text((x, y - 2), u_s, font=u_font, fill=uc);          x += uw_ + UG
+        draw.text((x, y + 2), "%", font=idle_unit, fill=uc)
 
     row(216, "CPU", stats["cpu_temp"], stats["cpu_use"])
     row(262, "GPU", stats["gpu_temp"], stats["gpu_use"])
