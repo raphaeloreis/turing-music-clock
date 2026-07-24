@@ -163,8 +163,8 @@ def draw_idle_screen():
     draw.line((60, 196, 420, 196), fill=(30, 40, 52), width=2)
 
     def row(y, label, t_val, u_val):
-        t_s = f"{t_val:.0f}" if t_val is not None else "--"
-        u_s = f"{u_val:.0f}" if u_val is not None else "--"
+        t_s = f"{t_val:02.0f}" if t_val is not None else "--"
+        u_s = f"{u_val:02.0f}" if u_val is not None else "--"
         t_font = dseg_val if t_val is not None else idle_unit
         u_font = dseg_val if u_val is not None else idle_unit
         LG, UG, SG = 16, 4, 30
