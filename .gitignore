@@ -1,3 +1,17 @@
-log.log
+# Ambiente virtual
+.venv/
+venv/
+
+# Python
 __pycache__/
 *.pyc
+*.pyo
+
+# Logs
+log.log
+*.log
+
+# Arquivos temporarios / previews
+_*.py
+_*.png
+*.tmp

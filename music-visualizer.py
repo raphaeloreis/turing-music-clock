@@ -3,24 +3,277 @@ from library.lcd.lcd_comm_rev_a import LcdCommRevA
 from asyncio import run
 from winrt.windows.media.control import GlobalSystemMediaTransportControlsSessionManager as MediaManager
 from winrt.windows.storage.streams import DataReader, Buffer, InputStreamOptions
-from os import remove, name
+from os import name
 from os.path import dirname, abspath, join
 import signal
 from time import sleep, perf_counter
 from library.log import logger
-from tempfile import NamedTemporaryFile
 from io import BytesIO
 from PIL import Image, ImageFilter, ImageDraw, ImageFont
 from datetime import datetime
+import json
+import subprocess
+import urllib.request
+import psutil
 
 COM_PORT = "AUTO"
 REVISION = "A"
+IDLE_STYLE = "flip"  # tela ociosa: "digital" (relogio 7-seg) ou "flip" (painel de aeroporto)
 stop = False
 script_dir = dirname(abspath(__file__))
 
-font_bold = ImageFont.truetype("/res/fonts/roboto/Roboto-Black.ttf", 28)
-font_light = ImageFont.truetype("/res/fonts/roboto/Roboto-Medium.ttf", 26)
-font_light_small = ImageFont.truetype("/res/fonts/roboto/Roboto-Medium.ttf", 22)
+font_bold = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Black.ttf"), 28)
+font_light = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 26)
+font_light_small = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 22)
+font_temp = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 18)
+
+# --- Tela idle: relogio digital + metricas (tema escuro) --------------------
+dseg_big   = ImageFont.truetype(join(script_dir, "res", "fonts", "dseg", "DSEG7Classic-Bold.ttf"), 96)
+dseg_val   = ImageFont.truetype(join(script_dir, "res", "fonts", "dseg", "DSEG7Classic-Bold.ttf"), 30)
+idle_label = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Black.ttf"), 22)
+idle_unit  = ImageFont.truetype(join(script_dir, "res", "fonts", "roboto", "Roboto-Medium.ttf"), 20)
+IDLE_ACCENT = (56, 225, 255)   # cor "acesa" do relogio (ciano) - troque aqui p/ mudar o tema
+IDLE_GHOST  = (20, 48, 60)     # segmentos apagados do display
+IDLE_MUTED  = (120, 140, 165)  # rotulos/data
+_WD = ["SEG", "TER", "QUA", "QUI", "SEX", "SÁB", "DOM"]
+_MO = ["JAN", "FEV", "MAR", "ABR", "MAI", "JUN", "JUL", "AGO", "SET", "OUT", "NOV", "DEZ"]
+
+def _make_idle_bg():
+    top, bot = (12, 17, 24), (4, 6, 10)
+    col = Image.new("RGB", (1, 320))
+    for y in range(320):
+        f = y / 319
+        col.putpixel((0, y), tuple(int(top[i] + (bot[i] - top[i]) * f) for i in range(3)))
+    return col.resize((480, 320))
+
+_IDLE_BG = _make_idle_bg()
+
+def _temp_color(t):
+    if t is None: return IDLE_MUTED
+    if t < 55: return (70, 220, 150)
+    if t < 70: return (255, 185, 50)
+    return (255, 85, 85)
+
+# --- Sensores: temperatura + uso --------------------------------------------
+# CPU temp: LibreHardwareMonitor (rodar COMO ADMIN com "Run web server").
+# CPU uso: psutil. GPU temp+uso: nvidia-smi (driver ja instalado).
+LHM_URL = "http://localhost:8085/data.json"
+TEMP_REFRESH_SEC = 3  # o loop desenha a cada 1s; relemos os sensores a cada 3s
+_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # nao pisca console sob pythonw
+psutil.cpu_percent(interval=None)  # prime: 1a leitura serve de baseline
+_stats_cache = {"cpu_temp": None, "cpu_use": None, "gpu_temp": None, "gpu_use": None, "ts": None}
+
+def _parse_temp(value):
+    try:
+        return float(str(value).split()[0].replace(",", "."))
+    except (ValueError, IndexError):
+        return None
+
+def _find_cpu_temp(node, in_cpu=False, best=None):
+    text = node.get("Text") or ""
+    if any(hint in text for hint in ("Ryzen", "AMD", "CPU")):
+        in_cpu = True
+    value = node.get("Value") or ""
+    if in_cpu and "°C" in value:
+        low = text.lower()
+        if "tctl" in low or "tdie" in low:
+            rank = 3
+        elif "package" in low:
+            rank = 2
+        elif "core" in low:
+            rank = 1
+        else:
+            rank = 0
+        temp = _parse_temp(value)
+        if temp is not None and (best is None or rank > best[0]):
+            best = (rank, temp)
+    for child in (node.get("Children") or []):
+        best = _find_cpu_temp(child, in_cpu, best)
+    return best
+
+def read_cpu_temp():
+    try:
+        with urllib.request.urlopen(LHM_URL, timeout=1.0) as resp:
+            data = json.load(resp)
+    except Exception:
+        return None
+    best = _find_cpu_temp(data)
+    return best[1] if best else None
+
+def read_cpu_usage():
+    try:
+        return psutil.cpu_percent(interval=None)
+    except Exception:
+        return None
+
+def read_gpu_stats():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2.0, creationflags=_no_window,
+        )
+        if out.returncode == 0:
+            parts = out.stdout.strip().splitlines()[0].split(",")
+            temp = _parse_temp(parts[0])
+            use = _parse_temp(parts[1]) if len(parts) > 1 else None
+            return temp, use
+    except Exception:
+        pass
+    return None, None
+
+def get_stats():
+    now = perf_counter()
+    if _stats_cache["ts"] is None or now - _stats_cache["ts"] >= TEMP_REFRESH_SEC:
+        _stats_cache["cpu_temp"] = read_cpu_temp()
+        _stats_cache["cpu_use"] = read_cpu_usage()
+        _stats_cache["gpu_temp"], _stats_cache["gpu_use"] = read_gpu_stats()
+        _stats_cache["ts"] = now
+    return _stats_cache
+
+def draw_idle_screen():
+    now = datetime.now()
+    stats = get_stats()
+    img = _IDLE_BG.copy()
+    draw = ImageDraw.Draw(img)
+
+    hhmm = now.strftime("%H:%M")
+    date_str = f"{_WD[now.weekday()]}, {now.day} {_MO[now.month - 1]}"
+
+    clock_y = 34
+    bb = draw.textbbox((0, 0), "88:88", font=dseg_big)
+    cx = (480 - (bb[2] - bb[0])) // 2 - bb[0]
+
+    # glow neon atras do relogio
+    glow = Image.new("RGBA", (480, 320), (0, 0, 0, 0))
+    ImageDraw.Draw(glow).text((cx, clock_y), hhmm, font=dseg_big, fill=IDLE_ACCENT + (255,))
+    glow = glow.filter(ImageFilter.GaussianBlur(9))
+    img.paste(glow, (0, 0), glow)
+
+    # segmentos apagados (ghost) + hora por cima
+    draw.text((cx, clock_y), "88:88", font=dseg_big, fill=IDLE_GHOST)
+    draw.text((cx, clock_y), hhmm, font=dseg_big, fill=IDLE_ACCENT)
+
+    # data centralizada
+    bbd = draw.textbbox((0, 0), date_str, font=font_light_small)
+    dx = (480 - (bbd[2] - bbd[0])) // 2 - bbd[0]
+    draw.text((dx, 150), date_str, font=font_light_small, fill=IDLE_MUTED)
+
+    draw.line((60, 196, 420, 196), fill=(30, 40, 52), width=2)
+
+    def row(y, label, t_val, u_val):
+        draw.text((70, y), label, font=idle_label, fill=IDLE_MUTED)
+        if t_val is not None:
+            tc = _temp_color(t_val)
+            s = f"{t_val:.0f}"
+            draw.text((150, y - 2), s, font=dseg_val, fill=tc)
+            b = draw.textbbox((150, y - 2), s, font=dseg_val)
+            draw.text((b[2] + 4, y + 2), "°C", font=idle_unit, fill=tc)
+        else:
+            draw.text((150, y + 2), "--", font=idle_unit, fill=IDLE_MUTED)
+        if u_val is not None:
+            s = f"{u_val:.0f}"
+            draw.text((250, y - 2), s, font=dseg_val, fill=IDLE_ACCENT)
+            b = draw.textbbox((250, y - 2), s, font=dseg_val)
+            draw.text((b[2] + 4, y + 2), "%", font=idle_unit, fill=IDLE_ACCENT)
+        else:
+            draw.text((250, y + 2), "--", font=idle_unit, fill=IDLE_MUTED)
+
+    row(216, "CPU", stats["cpu_temp"], stats["cpu_use"])
+    row(262, "GPU", stats["gpu_temp"], stats["gpu_use"])
+    return img
+
+# --- Tela idle 2: relogio flip / painel de aeroporto (split-flap) -----------
+flip_clock_font = ImageFont.truetype(join(script_dir, "res", "fonts", "bebas", "BebasNeue-Regular.ttf"), 108)
+flip_val_font   = ImageFont.truetype(join(script_dir, "res", "fonts", "bebas", "BebasNeue-Regular.ttf"), 48)
+flip_label_font = ImageFont.truetype(join(script_dir, "res", "fonts", "bebas", "BebasNeue-Regular.ttf"), 34)
+flip_unit_font  = ImageFont.truetype(join(script_dir, "res", "fonts", "bebas", "BebasNeue-Regular.ttf"), 30)
+flip_date_font  = ImageFont.truetype(join(script_dir, "res", "fonts", "bebas", "BebasNeue-Regular.ttf"), 34)
+FLIP_CARD     = (26, 26, 31)
+FLIP_CARD_TOP = (40, 40, 47)
+FLIP_SEAM     = (8, 8, 10)
+FLIP_CHAR     = (240, 235, 224)
+
+def _flip_tile(draw, x, y, w, h, ch, font):
+    r = max(6, h // 12)
+    draw.rounded_rectangle((x, y, x + w, y + h), radius=r, fill=FLIP_CARD)
+    mid = y + h // 2
+    draw.rounded_rectangle((x, y, x + w, mid + r), radius=r, fill=FLIP_CARD_TOP)  # topo mais claro
+    draw.rectangle((x, mid, x + w, mid + r), fill=FLIP_CARD_TOP)
+    if ch:
+        bb = draw.textbbox((0, 0), ch, font=font)
+        cw, chh = bb[2] - bb[0], bb[3] - bb[1]
+        draw.text((x + (w - cw) // 2 - bb[0], y + (h - chh) // 2 - bb[1]), ch, font=font, fill=FLIP_CHAR)
+    draw.rectangle((x, mid - 1, x + w, mid + 1), fill=FLIP_SEAM)  # fenda das abas
+
+def draw_flip_screen():
+    now = datetime.now()
+    stats = get_stats()
+    hhmm = now.strftime("%H:%M")
+    img = _IDLE_BG.copy()
+    draw = ImageDraw.Draw(img)
+
+    # relogio grande: [H][H] : [M][M]
+    tw, th, gap, sg, cg = 80, 102, 8, 12, 26
+    y0 = 20
+    x = 47
+    _flip_tile(draw, x, y0, tw, th, hhmm[0], flip_clock_font); x += tw + gap
+    _flip_tile(draw, x, y0, tw, th, hhmm[1], flip_clock_font); x += tw + sg
+    colx = x + cg // 2
+    for cy in (y0 + th // 3, y0 + 2 * th // 3):
+        draw.ellipse((colx - 6, cy - 6, colx + 6, cy + 6), fill=FLIP_CHAR)
+    x += cg + sg
+    _flip_tile(draw, x, y0, tw, th, hhmm[3], flip_clock_font); x += tw + gap
+    _flip_tile(draw, x, y0, tw, th, hhmm[4], flip_clock_font)
+
+    # data como etiqueta (texto simples, estilo legenda de painel), sem tile
+    date_str = f"{_WD[now.weekday()]}  {now.day:02d}  {_MO[now.month - 1]}"
+    dw = draw.textlength(date_str, font=flip_date_font)
+    draw.text(((480 - dw) // 2, 136), date_str, font=flip_date_font, fill=IDLE_MUTED)
+
+    # linhas CPU / GPU com mini-tiles (bloco inteiro centralizado)
+    stw, sth, sgp = 40, 50, 6
+    LABEL_GAP, UNIT_GAP, SEC_GAP = 16, 5, 28
+
+    def _field_w(s):
+        return len(s) * stw + (len(s) - 1) * sgp
+
+    def _draw_field(x, y, s):
+        for ch in s:
+            _flip_tile(draw, x, y, stw, sth, ch, flip_val_font)
+            x += stw + sgp
+        return x - sgp  # sem o gap final
+
+    def row(y, label, t_val, u_val):
+        cy = y + sth // 2
+        ts = f"{t_val:02.0f}" if t_val is not None else "--"
+        us = f"{u_val:02.0f}" if u_val is not None else "--"
+        lw = draw.textlength(label, font=flip_label_font)
+        dw = draw.textlength("°C", font=flip_unit_font)
+        pw = draw.textlength("%", font=flip_unit_font)
+        total = lw + LABEL_GAP + _field_w(ts) + UNIT_GAP + dw + SEC_GAP + _field_w(us) + UNIT_GAP + pw
+        x = (480 - total) // 2
+
+        def vtext(tx, text, font):
+            bb = draw.textbbox((0, 0), text, font=font)
+            draw.text((tx, cy - (bb[3] - bb[1]) // 2 - bb[1]), text, font=font, fill=IDLE_MUTED)
+
+        vtext(x, label, flip_label_font)
+        x += lw + LABEL_GAP
+        x = _draw_field(x, y, ts) + UNIT_GAP
+        vtext(x, "°C", flip_unit_font)
+        x += dw + SEC_GAP
+        x = _draw_field(x, y, us) + UNIT_GAP
+        vtext(x, "%", flip_unit_font)
+
+    row(186, "CPU", stats["cpu_temp"], stats["cpu_use"])
+    row(250, "GPU", stats["gpu_temp"], stats["gpu_use"])
+    return img
+
+def render_idle():
+    if IDLE_STYLE == "flip":
+        return draw_flip_screen()
+    return draw_idle_screen()
 
 async def get_media_info(retries=3):
     sessions = await MediaManager.request_async()
@@ -213,11 +466,16 @@ def save_combined_thumbnail(thumbnail_data=None, title=None, artist=None, album_
 
     draw.text((398, 274), str(time), font=font_light_small, fill=inverse_color)
 
-    with NamedTemporaryFile(delete=False, suffix=".png") as temp_file:
-        combined_path = temp_file.name
-        combined.save(combined_path, format="PNG")
+    stats = get_stats()
+    cpu_t = f"{stats['cpu_temp']:.0f}°" if stats['cpu_temp'] is not None else "--"
+    cpu_u = f"{stats['cpu_use']:.0f}%" if stats['cpu_use'] is not None else "--"
+    gpu_t = f"{stats['gpu_temp']:.0f}°" if stats['gpu_temp'] is not None else "--"
+    gpu_u = f"{stats['gpu_use']:.0f}%" if stats['gpu_use'] is not None else "--"
+    # Faixa inferior: CPU (temp+uso) . GPU (temp+uso) . relogio (dir, ja desenhado)
+    draw.text((40, 280), f"CPU {cpu_t} {cpu_u}", font=font_temp, fill=inverse_color)
+    draw.text((200, 280), f"GPU {gpu_t} {gpu_u}", font=font_temp, fill=inverse_color)
 
-    return combined_path
+    return combined
 
 if __name__ == "__main__":
 
@@ -243,15 +501,15 @@ if __name__ == "__main__":
 
     lcd_comm.SetBackplateLedColor(led_color=(255, 255, 255))
 
-    lcd_comm.SetOrientation(orientation=Orientation.LANDSCAPE)
+    lcd_comm.SetOrientation(orientation=Orientation.REVERSE_LANDSCAPE)
 
-    background = join(script_dir, "res", "starting.png")
-
-    logger.debug("setting background picture")
+    logger.debug("setting startup idle screen")
     start = perf_counter()
-    lcd_comm.DisplayBitmap(background)
+    startup_image = render_idle()
+    lcd_comm.DisplayPILImage(startup_image)
+    last_frame = startup_image.tobytes()
     end = perf_counter()
-    logger.debug(f"background picture set (took {end - start:.3f} s)")
+    logger.debug(f"startup idle screen set (took {end - start:.3f} s)")
 
     while not stop:
         start = perf_counter()
@@ -271,18 +529,20 @@ if __name__ == "__main__":
 
                 buffer_reader = DataReader.from_buffer(thumb_read_buffer)
                 thumbnail_byte_buffer = buffer_reader.read_buffer(thumb_read_buffer.length)
-                combined_path = save_combined_thumbnail(thumbnail_byte_buffer, title, artist, album_title, status)
+                combined_image = save_combined_thumbnail(thumbnail_byte_buffer, title, artist, album_title, status)
             else:
-                combined_path = save_combined_thumbnail(None, title, artist, album_title, status)
+                combined_image = save_combined_thumbnail(None, title, artist, album_title, status)
 
         else:
-            combined_path = save_combined_thumbnail(None, "No media detected", None, None, status)
+            combined_image = render_idle()
 
-        lcd_comm.DisplayBitmap(combined_path)
-        remove(combined_path)
+        # so reenvia pra tela se a imagem mudou (evita refresh visivel a toa)
+        frame = combined_image.tobytes()
+        if frame != last_frame:
+            lcd_comm.DisplayPILImage(combined_image)
+            last_frame = frame
+            logger.debug(f"refresh done (took {perf_counter() - start:.3f} s)")
 
-        end = perf_counter()
-        logger.debug(f"refresh done (took {end - start:.3f} s)")
         sleep(1)
 
     lcd_comm.closeSerial()

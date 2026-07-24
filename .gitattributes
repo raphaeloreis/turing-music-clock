@@ -1,0 +1,13 @@
+# Normaliza fim de linha (evita ruido de CRLF/LF entre Windows e Linux)
+* text=auto eol=lf
+
+# Scripts do Windows devem manter CRLF
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Binarios (nao converter)
+*.ttf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
