@@ -15,6 +15,7 @@ import json
 import subprocess
 import urllib.request
 import psutil
+import serial
 
 COM_PORT = "AUTO"
 REVISION = "A"
@@ -493,29 +494,33 @@ if __name__ == "__main__":
     if is_posix:
         signal.signal(signal.SIGQUIT, sighandler)
 
+    RECONNECT_WAIT = 3  # segundos entre tentativas de reconexao ao display
+
+    def connect_lcd():
+        logger.info("Selected Hardware Revision A (Turing Smart Screen 3.5\" & UsbPCMonitor 3.5\"/5\")")
+        lcd = LcdCommRevA(com_port=COM_PORT, display_width=320, display_height=480)
+        lcd.Reset()
+        lcd.InitializeComm()
+        lcd.SetBrightness(level=50)
+        lcd.SetBackplateLedColor(led_color=(255, 255, 255))
+        lcd.SetOrientation(orientation=Orientation.REVERSE_LANDSCAPE)
+        return lcd
+
     lcd_comm = None
-    logger.info("Selected Hardware Revision A (Turing Smart Screen 3.5\" & UsbPCMonitor 3.5\"/5\")")
-    lcd_comm = LcdCommRevA(com_port=COM_PORT, display_width=320, display_height=480)
-
-    lcd_comm.Reset()
-
-    lcd_comm.InitializeComm()
-
-    lcd_comm.SetBrightness(level=50)
-
-    lcd_comm.SetBackplateLedColor(led_color=(255, 255, 255))
-
-    lcd_comm.SetOrientation(orientation=Orientation.REVERSE_LANDSCAPE)
-
-    logger.debug("setting startup idle screen")
-    start = perf_counter()
-    startup_image = render_idle()
-    lcd_comm.DisplayPILImage(startup_image)
-    last_frame = startup_image.tobytes()
-    end = perf_counter()
-    logger.debug(f"startup idle screen set (took {end - start:.3f} s)")
+    last_frame = None
 
     while not stop:
+        # (re)conecta ao display se necessario (ex.: cabo desconectado e religado)
+        if lcd_comm is None:
+            try:
+                lcd_comm = connect_lcd()
+                last_frame = None  # forca redesenho ao (re)conectar
+                logger.info("Display conectado.")
+            except (serial.SerialException, OSError) as e:
+                logger.error(f"Display indisponivel ({e}). Nova tentativa em {RECONNECT_WAIT}s...")
+                sleep(RECONNECT_WAIT)
+                continue
+
         start = perf_counter()
         media_info = run(get_media_info())
         if media_info:
@@ -543,10 +548,21 @@ if __name__ == "__main__":
         # so reenvia pra tela se a imagem mudou (evita refresh visivel a toa)
         frame = combined_image.tobytes()
         if frame != last_frame:
-            lcd_comm.DisplayPILImage(combined_image)
-            last_frame = frame
-            logger.debug(f"refresh done (took {perf_counter() - start:.3f} s)")
+            try:
+                lcd_comm.DisplayPILImage(combined_image)
+                last_frame = frame
+                logger.debug(f"refresh done (took {perf_counter() - start:.3f} s)")
+            except (serial.SerialException, OSError) as e:
+                # cabo caiu no meio do envio -> descarta a conexao e reconecta no proximo ciclo
+                logger.error(f"Conexao com o display caiu ({e}). Reconectando...")
+                try:
+                    lcd_comm.closeSerial()
+                except Exception:
+                    pass
+                lcd_comm = None
+                continue
 
         sleep(1)
 
-    lcd_comm.closeSerial()
+    if lcd_comm is not None:
+        lcd_comm.closeSerial()
