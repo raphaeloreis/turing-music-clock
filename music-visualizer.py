@@ -16,6 +16,8 @@ import subprocess
 import urllib.request
 import psutil
 import serial
+import ctypes
+import threading
 
 COM_PORT = "AUTO"
 REVISION = "A"
@@ -494,6 +496,47 @@ if __name__ == "__main__":
     if is_posix:
         signal.signal(signal.SIGQUIT, sighandler)
 
+    lcd_comm = None
+    serial_lock = threading.Lock()
+    _cleanup_done = False
+
+    def cleanup_display():
+        # Apaga a tela ao sair (senao ela fica congelada com o ultimo frame
+        # quando os USBs continuam energizados apos o PC desligar).
+        global _cleanup_done
+        if _cleanup_done:
+            return
+        _cleanup_done = True
+        with serial_lock:
+            try:
+                if lcd_comm is not None:
+                    lcd_comm.ScreenOff()
+                    lcd_comm.closeSerial()
+            except Exception:
+                pass
+
+    # Windows: captura CLOSE/LOGOFF/SHUTDOWN p/ apagar a tela mesmo em background
+    # (pythonw nao recebe SIGTERM no desligamento). Usa um console oculto.
+    if name == 'nt':
+        _k32 = ctypes.windll.kernel32
+        _u32 = ctypes.windll.user32
+        if not _k32.GetConsoleWindow():
+            _k32.AllocConsole()
+            _console = _k32.GetConsoleWindow()
+            if _console:
+                _u32.ShowWindow(_console, 0)  # SW_HIDE
+        _CTRL_HANDLER = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _win_ctrl_handler(ctrl_type):
+            global stop
+            if ctrl_type in (2, 5, 6):  # CTRL_CLOSE / CTRL_LOGOFF / CTRL_SHUTDOWN
+                stop = True
+                cleanup_display()
+            return True
+
+        _win_ctrl_ref = _CTRL_HANDLER(_win_ctrl_handler)
+        _k32.SetConsoleCtrlHandler(_win_ctrl_ref, True)
+
     RECONNECT_WAIT = 3  # segundos entre tentativas de reconexao ao display
 
     def connect_lcd():
@@ -501,12 +544,12 @@ if __name__ == "__main__":
         lcd = LcdCommRevA(com_port=COM_PORT, display_width=320, display_height=480)
         lcd.Reset()
         lcd.InitializeComm()
+        lcd.ScreenOn()  # garante a tela ligada (caso tenha sido apagada ao sair)
         lcd.SetBrightness(level=50)
         lcd.SetBackplateLedColor(led_color=(255, 255, 255))
         lcd.SetOrientation(orientation=Orientation.REVERSE_LANDSCAPE)
         return lcd
 
-    lcd_comm = None
     last_frame = None
 
     while not stop:
@@ -549,7 +592,8 @@ if __name__ == "__main__":
         frame = combined_image.tobytes()
         if frame != last_frame:
             try:
-                lcd_comm.DisplayPILImage(combined_image)
+                with serial_lock:
+                    lcd_comm.DisplayPILImage(combined_image)
                 last_frame = frame
                 logger.debug(f"refresh done (took {perf_counter() - start:.3f} s)")
             except (serial.SerialException, OSError) as e:
@@ -564,5 +608,4 @@ if __name__ == "__main__":
 
         sleep(1)
 
-    if lcd_comm is not None:
-        lcd_comm.closeSerial()
+    cleanup_display()
