@@ -3,6 +3,7 @@ Pillow~=10.3.0        # geracao das imagens
 pyserial~=3.5         # comunicacao serial com o display
 numpy~=1.26.4         # serializacao eficiente da imagem
 psutil~=5.9.8         # uso da CPU
+pywin32>=306          # hook de desligamento (apaga a tela no shutdown)
 
 # Integracao com a midia do Windows (SMTC) - somente Windows
 winrt-runtime~=3.2.1

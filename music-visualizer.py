@@ -18,6 +18,7 @@ import psutil
 import serial
 import ctypes
 import threading
+import atexit
 
 COM_PORT = "AUTO"
 REVISION = "A"
@@ -500,42 +501,75 @@ if __name__ == "__main__":
     serial_lock = threading.Lock()
     _cleanup_done = False
 
-    def cleanup_display():
+    def cleanup_display(reason="saida"):
         # Apaga a tela ao sair (senao ela fica congelada com o ultimo frame
         # quando os USBs continuam energizados apos o PC desligar).
         global _cleanup_done
         if _cleanup_done:
             return
         _cleanup_done = True
+        logger.info(f"cleanup: apagando a tela (motivo: {reason})")
         with serial_lock:
             try:
                 if lcd_comm is not None:
                     lcd_comm.ScreenOff()
                     lcd_comm.closeSerial()
+                    logger.info("cleanup: ScreenOff enviado com sucesso")
+            except Exception as e:
+                logger.error(f"cleanup falhou: {e}")
+
+    atexit.register(lambda: cleanup_display("atexit"))
+
+    # Windows: janela oculta que trata WM_QUERYENDSESSION/WM_ENDSESSION para apagar
+    # a tela no desligamento/logoff, mesmo rodando em background (pythonw nao recebe
+    # SIGTERM). Roda numa thread com bomba de mensagens.
+    def _win_shutdown_hook():
+        try:
+            import win32con
+            import win32gui
+        except Exception as e:
+            logger.warning(f"pywin32 indisponivel; hook de shutdown desativado ({e})")
+            return
+
+        def wndproc(hwnd, msg, wparam, lparam):
+            global stop
+            if msg == win32con.WM_QUERYENDSESSION:
+                logger.info("WM_QUERYENDSESSION (desligamento iniciando)")
+                return True  # permite o shutdown
+            if msg == win32con.WM_ENDSESSION:
+                if wparam:
+                    logger.info("WM_ENDSESSION: sessao encerrando")
+                    stop = True
+                    cleanup_display("WM_ENDSESSION")
+                return 0
+            if msg == win32con.WM_CLOSE:
+                logger.info("WM_CLOSE")
+                stop = True
+                cleanup_display("WM_CLOSE")
+                win32gui.DestroyWindow(hwnd)
+                return 0
+            if msg == win32con.WM_DESTROY:
+                win32gui.PostQuitMessage(0)
+                return 0
+            return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+
+        try:
+            wc = win32gui.WNDCLASS()
+            wc.lpszClassName = "TuringMusicClockShutdownHook"
+            wc.lpfnWndProc = wndproc
+            atom = win32gui.RegisterClass(wc)
+            win32gui.CreateWindow(atom, "TuringMusicClock", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
+            try:
+                ctypes.windll.user32.SetProcessShutdownParameters(0x3FF, 0)  # ser notificado cedo
             except Exception:
                 pass
+            logger.info("hook de shutdown (janela oculta) instalado")
+            win32gui.PumpMessages()
+        except Exception as e:
+            logger.error(f"falha no hook de shutdown: {e}")
 
-    # Windows: captura CLOSE/LOGOFF/SHUTDOWN p/ apagar a tela mesmo em background
-    # (pythonw nao recebe SIGTERM no desligamento). Usa um console oculto.
     if name == 'nt':
-        _k32 = ctypes.windll.kernel32
-        _u32 = ctypes.windll.user32
-        if not _k32.GetConsoleWindow():
-            _k32.AllocConsole()
-            _console = _k32.GetConsoleWindow()
-            if _console:
-                _u32.ShowWindow(_console, 0)  # SW_HIDE
-        _CTRL_HANDLER = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
-
-        def _win_ctrl_handler(ctrl_type):
-            global stop
-            if ctrl_type in (2, 5, 6):  # CTRL_CLOSE / CTRL_LOGOFF / CTRL_SHUTDOWN
-                stop = True
-                cleanup_display()
-            return True
-
-        _win_ctrl_ref = _CTRL_HANDLER(_win_ctrl_handler)
-        _k32.SetConsoleCtrlHandler(_win_ctrl_ref, True)
+        threading.Thread(target=_win_shutdown_hook, daemon=True).start()
 
     RECONNECT_WAIT = 3  # segundos entre tentativas de reconexao ao display
 
@@ -608,4 +642,4 @@ if __name__ == "__main__":
 
         sleep(1)
 
-    cleanup_display()
+    cleanup_display("fim do loop")
