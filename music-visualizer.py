@@ -508,15 +508,25 @@ if __name__ == "__main__":
         if _cleanup_done:
             return
         _cleanup_done = True
-        logger.info(f"cleanup: apagando a tela (motivo: {reason})")
-        with serial_lock:
-            try:
-                if lcd_comm is not None:
-                    lcd_comm.ScreenOff()
-                    lcd_comm.closeSerial()
-                    logger.info("cleanup: ScreenOff enviado com sucesso")
-            except Exception as e:
-                logger.error(f"cleanup falhou: {e}")
+        logger.info(f"cleanup ({reason}): apagando a tela")
+        got = serial_lock.acquire(timeout=3)  # espera um desenho em andamento, sem travar p/ sempre
+        logger.info("cleanup: lock " + ("ok" if got else "TIMEOUT (seguindo assim mesmo)"))
+        try:
+            if lcd_comm is None:
+                logger.warning("cleanup: lcd_comm e None, nada a apagar")
+            else:
+                lcd_comm.ScreenOff()
+                try:
+                    lcd_comm.lcd_serial.flush()  # garante os bytes saindo antes do processo morrer
+                except Exception:
+                    pass
+                lcd_comm.closeSerial()
+                logger.info("cleanup: ScreenOff enviado com sucesso")
+        except Exception as e:
+            logger.error(f"cleanup falhou: {e}")
+        finally:
+            if got:
+                serial_lock.release()
 
     atexit.register(lambda: cleanup_display("atexit"))
 
@@ -534,11 +544,13 @@ if __name__ == "__main__":
         def wndproc(hwnd, msg, wparam, lparam):
             global stop
             if msg == win32con.WM_QUERYENDSESSION:
-                logger.info("WM_QUERYENDSESSION (desligamento iniciando)")
+                # Windows AGUARDA nosso retorno aqui -> melhor momento p/ apagar a tela
+                logger.info("WM_QUERYENDSESSION: apagando a tela antes de liberar o shutdown")
+                stop = True
+                cleanup_display("WM_QUERYENDSESSION")
                 return True  # permite o shutdown
             if msg == win32con.WM_ENDSESSION:
                 if wparam:
-                    logger.info("WM_ENDSESSION: sessao encerrando")
                     stop = True
                     cleanup_display("WM_ENDSESSION")
                 return 0
