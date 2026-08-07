@@ -530,58 +530,60 @@ if __name__ == "__main__":
 
     atexit.register(lambda: cleanup_display("atexit"))
 
-    # Windows: janela oculta que trata WM_QUERYENDSESSION/WM_ENDSESSION para apagar
-    # a tela no desligamento/logoff, mesmo rodando em background (pythonw nao recebe
-    # SIGTERM). Roda numa thread com bomba de mensagens.
-    def _win_shutdown_hook():
+    # Windows: janela oculta na THREAD PRINCIPAL para receber os eventos de
+    # desligamento/logoff (WM_QUERYENDSESSION/WM_ENDSESSION/...) e apagar a tela.
+    # Mesmo padrao do projeto base (turing-smart-screen-python): as mensagens sao
+    # processadas com PumpWaitingMessages() dentro do loop, nao numa thread.
+    win_hwnd = None
+    win32gui = None
+    if name == 'nt':
         try:
             import win32con
+            import win32api
             import win32gui
-        except Exception as e:
-            logger.warning(f"pywin32 indisponivel; hook de shutdown desativado ({e})")
-            return
 
-        def wndproc(hwnd, msg, wparam, lparam):
-            global stop
-            if msg == win32con.WM_QUERYENDSESSION:
-                # Windows AGUARDA nosso retorno aqui -> melhor momento p/ apagar a tela
-                logger.info("WM_QUERYENDSESSION: apagando a tela antes de liberar o shutdown")
-                stop = True
-                cleanup_display("WM_QUERYENDSESSION")
-                return True  # permite o shutdown
-            if msg == win32con.WM_ENDSESSION:
-                if wparam:
+            def _on_win_ctrl(event):
+                global stop
+                if event in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT,
+                             win32con.CTRL_CLOSE_EVENT, win32con.CTRL_LOGOFF_EVENT,
+                             win32con.CTRL_SHUTDOWN_EVENT):
                     stop = True
-                    cleanup_display("WM_ENDSESSION")
-                return 0
-            if msg == win32con.WM_CLOSE:
-                logger.info("WM_CLOSE")
-                stop = True
-                cleanup_display("WM_CLOSE")
-                win32gui.DestroyWindow(hwnd)
-                return 0
-            if msg == win32con.WM_DESTROY:
-                win32gui.PostQuitMessage(0)
-                return 0
-            return win32gui.DefWindowProc(hwnd, msg, wparam, lparam)
+                    cleanup_display("ctrl-event")
+                return True
 
-        try:
-            wc = win32gui.WNDCLASS()
-            wc.lpszClassName = "TuringMusicClockShutdownHook"
-            wc.lpfnWndProc = wndproc
-            atom = win32gui.RegisterClass(wc)
-            win32gui.CreateWindow(atom, "TuringMusicClock", 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None)
+            def _on_win_msg(hWnd, msg, wParam, lParam):
+                global stop
+                logger.info("evento do Windows %s -> apagando a tela" % msg)
+                cleanup_display("winmsg %s" % msg)
+                stop = True
+                if msg == win32con.WM_QUERYENDSESSION:
+                    return True  # permite o shutdown (tela ja apagada)
+                return 0
+
             try:
-                ctypes.windll.user32.SetProcessShutdownParameters(0x3FF, 0)  # ser notificado cedo
+                win32api.SetConsoleCtrlHandler(_on_win_ctrl, True)
             except Exception:
                 pass
-            logger.info("hook de shutdown (janela oculta) instalado")
-            win32gui.PumpMessages()
-        except Exception as e:
-            logger.error(f"falha no hook de shutdown: {e}")
 
-    if name == 'nt':
-        threading.Thread(target=_win_shutdown_hook, daemon=True).start()
+            hinst = win32api.GetModuleHandle(None)
+            wndclass = win32gui.WNDCLASS()
+            wndclass.hInstance = hinst
+            wndclass.lpszClassName = "turingMusicClockEventWnd"
+            wndclass.lpfnWndProc = {
+                win32con.WM_QUERYENDSESSION: _on_win_msg,
+                win32con.WM_ENDSESSION: _on_win_msg,
+                win32con.WM_QUIT: _on_win_msg,
+                win32con.WM_DESTROY: _on_win_msg,
+                win32con.WM_CLOSE: _on_win_msg,
+            }
+            wc_atom = win32gui.RegisterClass(wndclass)
+            win_hwnd = win32gui.CreateWindowEx(
+                win32con.WS_EX_LEFT, wc_atom, "turingMusicClockEvent", 0,
+                0, 0, win32con.CW_USEDEFAULT, win32con.CW_USEDEFAULT, 0, 0, hinst, None)
+            logger.info("janela de eventos de shutdown criada (thread principal)")
+        except Exception as e:
+            logger.error("falha ao criar janela de eventos de shutdown: %s" % e)
+            win_hwnd = None
 
     RECONNECT_WAIT = 3  # segundos entre tentativas de reconexao ao display
 
@@ -652,6 +654,12 @@ if __name__ == "__main__":
                 lcd_comm = None
                 continue
 
-        sleep(1)
+        # dorme ~1s processando com frequencia os eventos do Windows (shutdown/logoff)
+        for _ in range(5):
+            if stop:
+                break
+            if win_hwnd is not None:
+                win32gui.PumpWaitingMessages()
+            sleep(0.2)
 
     cleanup_display("fim do loop")
